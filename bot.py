@@ -263,11 +263,39 @@ def api(session: requests.Session, action: str, acc: dict, extra: dict = None, r
     return None
 
 def extract_balance(d):
-    if not isinstance(d, dict): return None
-    for k in ["mined_balance", "balance", "atf", "amount"]:
-        if k in d: return d[k]
-        if "user" in d and k in d["user"]: return d["user"][k]
-        if "data" in d and isinstance(d["data"], dict) and k in d["data"]: return d["data"][k]
+    """Extract balance from API response"""
+    if not isinstance(d, dict): 
+        return None
+    
+    # Try different paths where balance might be
+    balance_paths = [
+        "mined_balance",
+        "balance", 
+        "atf",
+        "amount",
+        "user.mined_balance",
+        "user.balance",
+        "data.mined_balance",
+        "data.balance",
+        "data.user.mined_balance",
+        "data.user.balance"
+    ]
+    
+    for path in balance_paths:
+        parts = path.split('.')
+        value = d
+        for part in parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                value = None
+                break
+        if value is not None:
+            try:
+                return float(value)
+            except:
+                return value
+    
     return None
 
 def parse_username(init_data: str) -> str:
@@ -288,6 +316,25 @@ def get_tg_id(acc):
     except:
         return ""
 
+def update_balance_from_response(acc, response):
+    """Update account balance from API response"""
+    if not response:
+        return False
+    
+    # Try to get balance from response
+    new_balance = extract_balance(response)
+    
+    if new_balance is not None:
+        try:
+            # Store as float with proper precision
+            with lock:
+                acc["balance"] = f"{float(new_balance):.6f}"
+                return True
+        except:
+            pass
+    
+    return False
+
 def process_mining(acc):
     with lock: 
         acc["mining_status"] = "Logging in..."
@@ -303,17 +350,15 @@ def process_mining(acc):
         with lock: 
             acc["mining_status"] = "Login Failed (Retrying)"
         acc["mining_end"] = time.time() + 5
+        sess.close()
         return
         
     token = login_res.get("token") or (login_res.get("data") or {}).get("token")
     if token: 
         sess.headers.update({"Authorization": f"Bearer {token}"})
     
-    # Get balance
-    bal = extract_balance(login_res)
-    if bal is not None:
-        with lock: 
-            acc["balance"] = str(bal)
+    # Update balance from login
+    update_balance_from_response(acc, login_res)
     
     # Get user data
     user_data = login_res.get("user", {})
@@ -348,6 +393,8 @@ def process_mining(acc):
     
     # Claim reward
     claim_res = api(sess, "claim", acc)
+    if claim_res:
+        update_balance_from_response(acc, claim_res)
     time.sleep(1)
     
     # Solve captcha
@@ -377,6 +424,9 @@ def process_mining(acc):
     start_res = api(sess, "start_mine", acc, extra=start_payload)
     
     if start_res and start_res.get("status") == "success":
+        # Update balance from start response
+        update_balance_from_response(acc, start_res)
+        
         with lock:
             acc["mining_status"] = f"Mining ({acc['balance']} ATF)"
             acc["mining_end"] = time.time() + 3600  # 1 hour
@@ -410,11 +460,8 @@ def process_boost(acc):
     if token: 
         sess.headers.update({"Authorization": f"Bearer {token}"})
     
-    # Get balance after login
-    bal = extract_balance(login_res)
-    if bal is not None:
-        with lock: 
-            acc["balance"] = str(bal)
+    # Update balance from login
+    update_balance_from_response(acc, login_res)
     
     tg_id = get_tg_id(acc)
     
@@ -432,17 +479,43 @@ def process_boost(acc):
         if boost_res.get("status") == "success":
             pending = boost_res.get("pending_reward", 0)
             
-            # Update balance if available
-            new_balance = boost_res.get("new_balance")
+            # IMPORTANT: Update balance from the actual API response
+            new_balance = extract_balance(boost_res)
+            
             if new_balance is not None:
                 with lock:
-                    acc["balance"] = str(new_balance)
-            
-            with lock:
-                acc["boost_status"] = f"+{pending} ATF"
-                # Send notification to Telegram
-                if authorized_chat_id:
-                    send_telegram_message(f"✅ <b>Tap Successful!</b>\nAccount: {acc['username']}\n+{pending} ATF\nBalance: {acc['balance']} ATF")
+                    # Store the actual balance from API
+                    acc["balance"] = f"{float(new_balance):.6f}"
+                    current_balance = acc["balance"]
+                    
+                    # Send notification with actual balance
+                    if authorized_chat_id:
+                        send_telegram_message(
+                            f"✅ <b>Tap Successful!</b>\n"
+                            f"Account: {acc['username']}\n"
+                            f"+{pending} ATF\n"
+                            f"Balance: {current_balance} ATF"
+                        )
+                    
+                    acc["boost_status"] = f"+{pending} ATF"
+            else:
+                # If balance not in response, use pending reward to update
+                try:
+                    current_balance = float(acc.get('balance', '0.0'))
+                    new_balance = current_balance + float(pending)
+                    with lock:
+                        acc["balance"] = f"{new_balance:.6f}"
+                        if authorized_chat_id:
+                            send_telegram_message(
+                                f"✅ <b>Tap Successful!</b>\n"
+                                f"Account: {acc['username']}\n"
+                                f"+{pending} ATF\n"
+                                f"Balance: {acc['balance']} ATF"
+                            )
+                        acc["boost_status"] = f"+{pending} ATF"
+                except:
+                    with lock:
+                        acc["boost_status"] = f"+{pending} ATF"
             
             # Check boost_ready_at for cooldown
             ready_at = boost_res.get("boost_ready_at", 0)
@@ -511,6 +584,9 @@ def process_tasks(acc):
     if token: 
         sess.headers.update({"Authorization": f"Bearer {token}"})
     
+    # Update balance
+    update_balance_from_response(acc, login_res)
+    
     tg_id = get_tg_id(acc)
     if not tg_id:
         with lock: 
@@ -564,6 +640,8 @@ def process_tasks(acc):
         if claim_res and claim_res.get("status") == "success":
             start_count += 1
             completed_tasks.append(tid)
+            # Update balance from claim response
+            update_balance_from_response(acc, claim_res)
         
         time.sleep(1)
     
@@ -752,7 +830,7 @@ def main():
     for acc in ACCOUNTS:
         t = threading.Thread(target=worker_thread, args=(acc,), daemon=True)
         t.start()
-        time.sleep(0.5)  # Stagger thread starts
+        time.sleep(0.5)
 
     # Main loop
     if not PRODUCTION_MODE:
