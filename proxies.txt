@@ -1,0 +1,4 @@
+(IP:Port)
+(IP:Port:User:Pass)
+(User:Pass@IP:Port)
+http://... or socks5://...
