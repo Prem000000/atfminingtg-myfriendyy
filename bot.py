@@ -582,15 +582,15 @@ def handle_message(message):
     
     # Handle /start command
     elif text.lower() == '/start':
-        start_msg = """🚀 <b>ATF Miners Bot is Active!</b>
+        start_msg = f"""🚀 <b>ATF Miners Bot is Active!</b>
 
 📊 <b>Status:</b> Running
-👥 <b>Accounts:</b> {count} account(s)
+👥 <b>Accounts:</b> {len(ACCOUNTS)} account(s)
 
 Use /status to check real-time mining status
 Use /help for available commands
 
-Bot is automatically mining, tapping, and completing tasks!""".format(count=len(ACCOUNTS))
+Bot is automatically mining, tapping, and completing tasks!"""
         send_telegram_message(start_msg)
 
 def polling_loop():
@@ -628,6 +628,8 @@ def polling_loop():
         time.sleep(1)
 
 def main():
+    global TELEGRAM_ENABLED  # <-- Add this line to fix the error
+    
     os.system('cls' if os.name == 'nt' else 'clear')
     print("🚀 ATF Miners Bot")
     print("=" * 50)
