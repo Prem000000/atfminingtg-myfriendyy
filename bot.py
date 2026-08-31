@@ -38,9 +38,59 @@ HEADERS_TEMPLATE = {
     ),
 }
 
+# ============================================================
+#  TELEGRAM BOT CONFIGURATION
+# ============================================================
+TELEGRAM_BOT_TOKEN = "8411649204:AAGPnQhIMKKB1rhfoSgGz2ZBtBokNZX1eH4"  # Replace with your bot token
+TELEGRAM_CHAT_ID = "-1003628097142"      # Replace with your chat ID
+TELEGRAM_ENABLED = True                     # Set to False to disable Telegram notifications
+
 ACCOUNTS = []
 PROXIES_LIST = []
 lock = threading.Lock()
+last_telegram_update = {}  # Track last update time per account to avoid spam
+
+def send_telegram_message(message, parse_mode="HTML"):
+    """Send message to Telegram bot"""
+    if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": parse_mode
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Failed to send Telegram message: {e}")
+        return False
+
+def send_status_update(acc, status_type, message, send_always=False):
+    """Send status update with rate limiting (max once per 30 seconds per account per type)"""
+    if not TELEGRAM_ENABLED:
+        return
+    
+    key = f"{acc['username']}_{status_type}"
+    current_time = time.time()
+    
+    # Rate limit: only send if 30 seconds have passed or send_always is True
+    if not send_always and key in last_telegram_update:
+        if current_time - last_telegram_update[key] < 30:
+            return
+    
+    last_telegram_update[key] = current_time
+    
+    # Format message
+    msg = f"<b>🔄 {status_type.upper()} Update</b>\n"
+    msg += f"<b>Account:</b> {acc['username']}\n"
+    msg += f"<b>Status:</b> {message}\n"
+    msg += f"<b>Balance:</b> {acc.get('balance', '0.0')} ATF\n"
+    msg += f"<b>Time:</b> {time.strftime('%H:%M:%S')}"
+    
+    send_telegram_message(msg)
 
 def format_time_remaining(end_time):
     if end_time <= 0: return "Ready"
@@ -148,7 +198,9 @@ def api(session: requests.Session, action: str, acc: dict, extra: dict = None, r
                 new_p = random.choice(PROXIES_LIST)
                 acc["proxy"] = new_p
                 session.proxies.update({"http": new_p, "https": new_p})
-                with lock: acc["mining_status"] = "Proxy Error, Rotating..."
+                with lock: 
+                    acc["mining_status"] = "Proxy Error, Rotating..."
+                    send_status_update(acc, "proxy", f"Proxy error, rotating to new proxy")
             if attempt < retries: time.sleep(5 * attempt)
             else: return None
         except requests.RequestException as e:
@@ -173,7 +225,9 @@ def parse_username(init_data: str) -> str:
         return "Account"
 
 def process_mining(acc):
-    with lock: acc["mining_status"] = "Logging in..."
+    with lock: 
+        acc["mining_status"] = "Logging in..."
+        send_status_update(acc, "mining", "Logging in...")
     
     sess = requests.Session()
     sess.headers.update(HEADERS_TEMPLATE)
@@ -182,7 +236,9 @@ def process_mining(acc):
         
     login_res = api(sess, "login", acc)
     if not login_res:
-        with lock: acc["mining_status"] = "Login Failed (Retrying)"
+        with lock: 
+            acc["mining_status"] = "Login Failed (Retrying)"
+            send_status_update(acc, "mining", "❌ Login Failed, retrying...")
         acc["mining_end"] = time.time() + 2
         return
         
@@ -191,7 +247,9 @@ def process_mining(acc):
     
     bal = extract_balance(login_res)
     if bal is not None:
-        with lock: acc["balance"] = str(bal)
+        with lock: 
+            acc["balance"] = str(bal)
+            send_status_update(acc, "balance", f"💰 Balance updated: {bal} ATF", send_always=True)
         
     user_data = login_res.get("user", {})
     if not user_data and "data" in login_res:
@@ -221,11 +279,15 @@ def process_mining(acc):
         wait_secs = 0.0
             
     if can_claim:
-        with lock: acc["mining_status"] = "Claiming Reward..."
+        with lock: 
+            acc["mining_status"] = "Claiming Reward..."
+            send_status_update(acc, "mining", "🔄 Claiming mining reward...")
         claim_res = api(sess, "claim", acc)
         time.sleep(2)
         
-        with lock: acc["mining_status"] = "Solving Captcha..."
+        with lock: 
+            acc["mining_status"] = "Solving Captcha..."
+            send_status_update(acc, "mining", "🧩 Solving captcha...")
         tg_id = user_data.get("tg_id", "")
         if not tg_id:
             try:
@@ -246,7 +308,9 @@ def process_mining(acc):
                 start_payload['math_answer'] = ans
             except: pass
         
-        with lock: acc["mining_status"] = "Starting New Mining..."
+        with lock: 
+            acc["mining_status"] = "Starting New Mining..."
+            send_status_update(acc, "mining", "⛏️ Starting new mining cycle...")
         start_res = api(sess, "start_mine", acc, extra=start_payload)
         
         has_error = False
@@ -255,14 +319,20 @@ def process_mining(acc):
         if start_res:
             if start_res.get("status") == "success":
                 wait_secs = 3600.0
+                with lock:
+                    send_status_update(acc, "mining", "✅ Mining started successfully! Next claim in 1 hour")
             else:
                 has_error = True
                 error_msg = start_res.get("message", start_res.get("reason", "Gagal Start"))
                 wait_secs = 60.0
+                with lock:
+                    send_status_update(acc, "mining", f"❌ Mining failed: {error_msg}")
         else:
             has_error = True
             error_msg = "Gagal HTTP Start"
             wait_secs = 60.0
+            with lock:
+                send_status_update(acc, "mining", f"❌ HTTP error starting mining")
             
     with lock: 
         if can_claim and has_error:
@@ -273,7 +343,9 @@ def process_mining(acc):
     sess.close()
 
 def process_boost(acc):
-    with lock: acc["boost_status"] = "Starting Tap..."
+    with lock: 
+        acc["boost_status"] = "Starting Tap..."
+        send_status_update(acc, "boost", "🔄 Starting auto-tap...")
     
     sess = requests.Session()
     sess.headers.update(HEADERS_TEMPLATE)
@@ -285,6 +357,7 @@ def process_boost(acc):
         with lock:
             acc["boost_status"] = "Login Failed"
             acc["boost_end"] = time.time() + 5.0
+            send_status_update(acc, "boost", "❌ Login failed")
         sess.close()
         return
         
@@ -314,6 +387,8 @@ def process_boost(acc):
             wait_time = 10.0
             pending = br.get("pending_reward", 0)
             status_msg = f"+{pending} ATF"
+            with lock:
+                send_status_update(acc, "boost", f"✅ Tap successful! +{pending} ATF")
             
             ready_at = br.get("boost_ready_at", 0)
             if ready_at:
@@ -322,15 +397,21 @@ def process_boost(acc):
         elif br.get("status") == "busy":
             status_msg = "Busy (Cooldown)"
             wait_time = 2.0
+            with lock:
+                send_status_update(acc, "boost", "⏳ Busy, cooldown active")
         elif br.get("status") == "cooldown":
             status_msg = "Sistem Cooldown"
             ready_at = br.get("boost_ready_at", 0)
             if ready_at:
                 sisa = ready_at - time.time()
                 if sisa > 0: wait_time = sisa
+            with lock:
+                send_status_update(acc, "boost", f"⏳ Cooldown, ready in {int(wait_time)}s")
     else:
         status_msg = "HTTP Failed"
         wait_time = 5.0
+        with lock:
+            send_status_update(acc, "boost", "❌ HTTP request failed")
         
     with lock:
         acc["boost_status"] = status_msg
@@ -338,7 +419,9 @@ def process_boost(acc):
     sess.close()
 
 def process_tasks(acc):
-    with lock: acc["task_status"] = "Preparing Tasks..."
+    with lock: 
+        acc["task_status"] = "Preparing Tasks..."
+        send_status_update(acc, "tasks", "🔄 Preparing to check tasks...")
     
     sess = requests.Session()
     sess.headers.update(HEADERS_TEMPLATE)
@@ -348,7 +431,9 @@ def process_tasks(acc):
     # Login to get valid token
     login_res = api(sess, "login", acc, retries=1)
     if not login_res:
-        with lock: acc["task_status"] = "Login failed, retrying..."
+        with lock: 
+            acc["task_status"] = "Login failed, retrying..."
+            send_status_update(acc, "tasks", "❌ Login failed")
         acc["task_end"] = time.time() + 2
         return
         
@@ -364,7 +449,9 @@ def process_tasks(acc):
         tg_id = ""
         
     if not tg_id:
-        with lock: acc["task_status"] = "Failed parsing TG ID"
+        with lock: 
+            acc["task_status"] = "Failed parsing TG ID"
+            send_status_update(acc, "tasks", "❌ Failed to parse Telegram ID")
         acc["task_end"] = time.time() + 60.0
         return
         
@@ -380,16 +467,21 @@ def process_tasks(acc):
     ]
     
     start_count = 0
+    claimed_tasks = []
     
     for tid in task_ids:
         if tid in completed_tasks:
             continue
             
-        with lock: acc["task_status"] = f"Start: {tid}"
+        with lock: 
+            acc["task_status"] = f"Start: {tid}"
+            send_status_update(acc, "tasks", f"🔄 Starting task: {tid}")
         sr = api(sess, "start_task", acc, extra={"tg_id": tg_id, "task_id": tid}, retries=1)
         
         # Selalu coba claim, baik start-nya success maupun sudah pernah di-start (cooldown)
-        with lock: acc["task_status"] = f"Claim: {tid}"
+        with lock: 
+            acc["task_status"] = f"Claim: {tid}"
+            send_status_update(acc, "tasks", f"🔄 Claiming task: {tid}")
         cr = api(sess, "claim_task", acc, extra={
             "tg_id": tg_id, 
             "task_id": tid, 
@@ -400,15 +492,25 @@ def process_tasks(acc):
         if cr and cr.get("status") == "success":
             start_count += 1
             completed_tasks.append(tid)
+            claimed_tasks.append(tid)
+            with lock:
+                send_status_update(acc, "tasks", f"✅ Task completed: {tid}")
             
         time.sleep(1)
             
     with lock:
         acc["task_status"] = f"Done (+{start_count} Claimed)"
         acc["task_end"] = time.time() + 60.0
+        if start_count > 0:
+            send_status_update(acc, "tasks", f"✅ Completed {start_count} tasks: {', '.join(claimed_tasks)}", send_always=True)
 
 def worker_thread(acc):
     time.sleep(random.uniform(0.5, 5.0)) # Stagger thread starts
+    
+    # Send initial status
+    with lock:
+        send_status_update(acc, "start", "🚀 Bot started successfully!", send_always=True)
+    
     while True:
         now = time.time()
         
@@ -432,6 +534,18 @@ def worker_thread(acc):
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
     print("🚀 ATF Miners Bot")
+    print("=" * 50)
+    
+    # Check Telegram configuration
+    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
+        print("⚠️  Telegram bot not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        print("   Status updates will only be shown in the terminal dashboard")
+    elif TELEGRAM_ENABLED:
+        print(f"✅ Telegram bot enabled! Sending updates to chat ID: {TELEGRAM_CHAT_ID}")
+        # Send startup message
+        send_telegram_message("🚀 <b>ATF Miners Bot Started!</b>\nBot is now running and monitoring your accounts.")
+    
+    print("=" * 50)
     
     use_proxy = input("Use proxies from proxies.txt? (y/n): ").strip().lower()
     proxies_list = []
@@ -472,6 +586,12 @@ def main():
         print("query.txt kosong!")
         sys.exit(1)
 
+    # Send account info to Telegram
+    if TELEGRAM_ENABLED:
+        account_list = "\n".join([f"• {acc['username']}" for acc in ACCOUNTS])
+        msg = f"📊 <b>Loaded {len(ACCOUNTS)} account(s):</b>\n{account_list}"
+        send_telegram_message(msg)
+
     # Kosongkan layar sebelum menjalankan UI Live
     os.system("cls" if os.name == "nt" else "clear")
 
@@ -487,6 +607,8 @@ def main():
                 live.update(generate_layout())
                 time.sleep(0.5)
     except KeyboardInterrupt:
+        if TELEGRAM_ENABLED:
+            send_telegram_message("🛑 <b>Bot Stopped</b>\nBot has been stopped by user.")
         sys.exit(0)
 
 if __name__ == "__main__":
