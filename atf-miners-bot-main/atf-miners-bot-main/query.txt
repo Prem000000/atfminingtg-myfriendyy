@@ -1,3 +1,1 @@
-query1
-query2
-query3
+query_id=AAECfHZ3AwAAAAJ8dnfeOSra&user=%7B%22id%22%3A8446704642%2C%22first_name%22%3A%22Lalu%22%2C%22last_name%22%3A%22%22%2C%22username%22%3A%22kikdle%22%2C%22language_code%22%3A%22en%22%2C%22allows_write_to_pm%22%3Atrue%2C%22photo_url%22%3A%22https%3A%5C%2F%5C%2Ft.me%5C%2Fi%5C%2Fuserpic%5C%2F320%5C%2F1mSo8bTh36Ohtz8hymvLjq2vV_6nJY4EDD2Ha0dqvQw_1wUx7M_BSW29_nkqjIyY.svg%22%7D&auth_date=1788153511&signature=LRH9xHf7cn8o_B7NyjUkPbnpw2P6wv8OHFiJ-gnW8EF1y9wA02KcdBvMpVOqwOPW3Tive0w56EA4VItr7c3MAQ&hash=e1e6a3c10695fd65d13038165056548e4fa67d4f32db677298597961bf08ffdb
