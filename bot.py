@@ -49,6 +49,7 @@ PROXIES_LIST = []
 lock = threading.Lock()
 last_update_id = 0
 authorized_chat_id = None
+last_debug_log = {}
 
 # ============================================================
 #  PRODUCTION MODE - Auto-detect
@@ -63,6 +64,25 @@ def is_production():
     return False
 
 PRODUCTION_MODE = is_production()
+
+def log_debug(acc, action, message, response=None):
+    """Log debug information"""
+    timestamp = time.strftime('%H:%M:%S')
+    key = f"{acc['username']}_{action}"
+    
+    log_entry = {
+        'time': timestamp,
+        'message': message,
+        'response': response
+    }
+    
+    with lock:
+        last_debug_log[key] = log_entry
+    
+    # Print to console
+    print(f"[{timestamp}] {acc['username']} - {action}: {message}")
+    if response and isinstance(response, dict):
+        print(f"  Response: {json.dumps(response, indent=2)[:500]}")
 
 def send_telegram_message(message, parse_mode="HTML"):
     global authorized_chat_id
@@ -140,6 +160,10 @@ def get_status_message():
             
             if acc.get('proxy'):
                 msg += f"  🔗 <b>Proxy:</b> ✅ Connected\n"
+            
+            # Show query info (first 50 chars)
+            query_preview = acc.get('query', '')[:50] + '...' if len(acc.get('query', '')) > 50 else acc.get('query', '')
+            msg += f"  📝 <b>Query:</b> <code>{query_preview}</code>\n"
             
             msg += "\n"
         
@@ -228,23 +252,34 @@ def api(session: requests.Session, action: str, acc: dict, extra: dict = None, r
     payload = {"initData": acc["query"]}
     if extra: payload.update(extra)
 
+    log_debug(acc, action, f"Sending request to {action}", payload)
+
     for attempt in range(1, retries + 1):
         try:
             r = session.post(url, json=payload, timeout=30)
             r.raise_for_status()
             try: 
                 response = r.json()
+                log_debug(acc, action, f"Response received (attempt {attempt})", response)
+                
+                # Check if response indicates invalid query
+                if response.get('status') == 'error' and 'query' in response.get('message', '').lower():
+                    log_debug(acc, action, "⚠️ Query appears to be invalid/expired!", response)
+                    
                 return response
             except: 
                 return {"raw": r.text}
         except requests.exceptions.HTTPError as e:
             try: 
-                return r.json()
+                response = r.json()
+                log_debug(acc, action, f"HTTP Error: {e}", response)
+                return response
             except: 
                 pass
             if attempt < retries: 
                 time.sleep(3)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ProxyError) as e:
+            log_debug(acc, action, f"Connection error: {e}")
             if PROXIES_LIST:
                 new_p = random.choice(PROXIES_LIST)
                 acc["proxy"] = new_p
@@ -256,6 +291,7 @@ def api(session: requests.Session, action: str, acc: dict, extra: dict = None, r
             else: 
                 return None
         except requests.RequestException as e:
+            log_debug(acc, action, f"Request error: {e}")
             if attempt < retries: 
                 time.sleep(5 * attempt)
             else: 
@@ -321,12 +357,10 @@ def update_balance_from_response(acc, response):
     if not response:
         return False
     
-    # Try to get balance from response
     new_balance = extract_balance(response)
     
     if new_balance is not None:
         try:
-            # Store as float with proper precision
             with lock:
                 acc["balance"] = f"{float(new_balance):.6f}"
                 return True
@@ -348,8 +382,17 @@ def process_mining(acc):
     login_res = api(sess, "login", acc)
     if not login_res:
         with lock: 
-            acc["mining_status"] = "Login Failed (Retrying)"
-        acc["mining_end"] = time.time() + 5
+            acc["mining_status"] = "Login Failed - Check Query"
+            acc["mining_end"] = time.time() + 60  # Wait longer if query is invalid
+        sess.close()
+        return
+        
+    # Check if login was successful
+    if login_res.get('status') == 'error':
+        error_msg = login_res.get('message', 'Unknown error')
+        with lock: 
+            acc["mining_status"] = f"Login Error: {error_msg[:30]}"
+            acc["mining_end"] = time.time() + 120  # Wait longer on error
         sess.close()
         return
         
@@ -424,7 +467,6 @@ def process_mining(acc):
     start_res = api(sess, "start_mine", acc, extra=start_payload)
     
     if start_res and start_res.get("status") == "success":
-        # Update balance from start response
         update_balance_from_response(acc, start_res)
         
         with lock:
@@ -452,7 +494,15 @@ def process_boost(acc):
     if not login_res:
         with lock:
             acc["boost_status"] = "Login Failed"
-            acc["boost_end"] = time.time() + 5
+            acc["boost_end"] = time.time() + 60
+        sess.close()
+        return
+    
+    if login_res.get('status') == 'error':
+        error_msg = login_res.get('message', 'Unknown error')
+        with lock:
+            acc["boost_status"] = f"Error: {error_msg[:20]}"
+            acc["boost_end"] = time.time() + 120
         sess.close()
         return
     
@@ -479,16 +529,14 @@ def process_boost(acc):
         if boost_res.get("status") == "success":
             pending = boost_res.get("pending_reward", 0)
             
-            # IMPORTANT: Update balance from the actual API response
+            # Update balance from the actual API response
             new_balance = extract_balance(boost_res)
             
             if new_balance is not None:
                 with lock:
-                    # Store the actual balance from API
                     acc["balance"] = f"{float(new_balance):.6f}"
                     current_balance = acc["balance"]
                     
-                    # Send notification with actual balance
                     if authorized_chat_id:
                         send_telegram_message(
                             f"✅ <b>Tap Successful!</b>\n"
@@ -576,7 +624,15 @@ def process_tasks(acc):
     if not login_res:
         with lock: 
             acc["task_status"] = "Login failed"
-            acc["task_end"] = time.time() + 30
+            acc["task_end"] = time.time() + 60
+        sess.close()
+        return
+    
+    if login_res.get('status') == 'error':
+        error_msg = login_res.get('message', 'Unknown error')
+        with lock:
+            acc["task_status"] = f"Error: {error_msg[:20]}"
+            acc["task_end"] = time.time() + 120
         sess.close()
         return
     
@@ -640,7 +696,6 @@ def process_tasks(acc):
         if claim_res and claim_res.get("status") == "success":
             start_count += 1
             completed_tasks.append(tid)
-            # Update balance from claim response
             update_balance_from_response(acc, claim_res)
         
         time.sleep(1)
@@ -703,10 +758,21 @@ def handle_message(message):
         status_msg = get_status_message()
         send_telegram_message(status_msg)
     
+    elif text.lower() == '/debug':
+        # Send debug info
+        debug_msg = "🔍 <b>Debug Information</b>\n\n"
+        for acc in ACCOUNTS:
+            debug_msg += f"<b>{acc['username']}</b>\n"
+            debug_msg += f"Query: {acc.get('query', '')[:100]}...\n"
+            debug_msg += f"Proxy: {acc.get('proxy', 'None')}\n"
+            debug_msg += f"Balance: {acc.get('balance', '0.0')}\n\n"
+        send_telegram_message(debug_msg)
+    
     elif text.lower() == '/help':
         help_msg = """<b>🤖 ATF Miners Bot Commands:</b>
 
-/status - Show real-time mining status for all accounts
+/status - Show real-time mining status
+/debug - Show debug information
 /help - Show this help message
 /start - Show bot info
 
@@ -724,6 +790,7 @@ def handle_message(message):
 👥 <b>Accounts:</b> {len(ACCOUNTS)} account(s)
 
 Use /status to check real-time mining status
+Use /debug for troubleshooting
 Use /help for available commands
 
 Bot is automatically mining, tapping, and completing tasks!"""
@@ -793,6 +860,7 @@ def main():
     # Load queries
     if not os.path.exists("query.txt"):
         print("❌ query.txt not found!")
+        print("   Please create query.txt with your Telegram Web App data")
         sys.exit(1)
         
     with open("query.txt", "r", encoding="utf-8") as f:
@@ -800,15 +868,25 @@ def main():
     
     if not queries:
         print("❌ query.txt is empty!")
+        print("   Add your Telegram Web App query data to query.txt")
         sys.exit(1)
+    
+    print(f"[+] Found {len(queries)} query entries")
     
     for i, q in enumerate(queries):
         proxy = proxies_list[i % len(proxies_list)] if proxies_list else None
         
+        # Validate query format
+        if not q or 'user=' not in q:
+            print(f"⚠️  Warning: Query {i+1} appears to be invalid (missing 'user=')")
+        
+        username = parse_username(q)
+        print(f"   Account {i+1}: {username}")
+        
         ACCOUNTS.append({
             "query": q,
             "proxy": proxy,
-            "username": parse_username(q),
+            "username": username,
             "balance": "0.0",
             "mining_status": "Starting...",
             "mining_end": 0,
@@ -819,6 +897,14 @@ def main():
         })
         
     print(f"[+] Loaded {len(ACCOUNTS)} account(s)")
+    print("=" * 50)
+    
+    # Warn about query expiration
+    print("⚠️  Note: The query data in query.txt may expire!")
+    print("   If you see login errors, you need to refresh the query:")
+    print("   1. Open the ATF Miners Telegram Mini App")
+    print("   2. Copy the new query data")
+    print("   3. Update query.txt")
     print("=" * 50)
 
     # Start Telegram polling
