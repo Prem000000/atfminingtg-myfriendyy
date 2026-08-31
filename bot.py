@@ -14,6 +14,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.console import Console
+from flask import Flask, request
+from threading import Thread
 
 # ============================================================
 #  ATF MINERS AUTO BOT (3-COLUMN DASHBOARD VERSION)
@@ -50,7 +52,10 @@ PROXIES_LIST = []
 lock = threading.Lock()
 last_telegram_update = {}  # Track last update time per account to avoid spam
 
-def send_telegram_message(message, parse_mode="HTML"):
+# Flask app for webhook
+app = Flask(__name__)
+
+def send_telegram_message(message, parse_mode="HTML", reply_to=None):
     """Send message to Telegram bot"""
     if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         return False
@@ -62,43 +67,94 @@ def send_telegram_message(message, parse_mode="HTML"):
             "text": message,
             "parse_mode": parse_mode
         }
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
         response = requests.post(url, json=payload, timeout=10)
         return response.status_code == 200
     except Exception as e:
         print(f"Failed to send Telegram message: {e}")
         return False
 
-def send_status_update(acc, status_type, message, send_always=False):
-    """Send status update with rate limiting (max once per 30 seconds per account per type)"""
-    if not TELEGRAM_ENABLED:
-        return
-    
-    key = f"{acc['username']}_{status_type}"
-    current_time = time.time()
-    
-    # Rate limit: only send if 30 seconds have passed or send_always is True
-    if not send_always and key in last_telegram_update:
-        if current_time - last_telegram_update[key] < 30:
-            return
-    
-    last_telegram_update[key] = current_time
-    
-    # Format message
-    msg = f"<b>🔄 {status_type.upper()} Update</b>\n"
-    msg += f"<b>Account:</b> {acc['username']}\n"
-    msg += f"<b>Status:</b> {message}\n"
-    msg += f"<b>Balance:</b> {acc.get('balance', '0.0')} ATF\n"
-    msg += f"<b>Time:</b> {time.strftime('%H:%M:%S')}"
-    
-    send_telegram_message(msg)
+def get_status_message():
+    """Generate comprehensive status report for all accounts"""
+    with lock:
+        if not ACCOUNTS:
+            return "❌ No accounts loaded"
+        
+        msg = "📊 <b>ATF MINERS STATUS REPORT</b>\n"
+        msg += "═" * 30 + "\n\n"
+        
+        total_balance = 0.0
+        
+        for i, acc in enumerate(ACCOUNTS, 1):
+            msg += f"<b>👤 Account {i}: {acc['username']}</b>\n"
+            
+            # Balance
+            balance = float(acc.get('balance', '0.0'))
+            total_balance += balance
+            msg += f"  💰 <b>Balance:</b> {balance:.4f} ATF\n"
+            
+            # Mining Status
+            mining_status = acc.get('mining_status', 'Unknown')
+            mining_end = acc.get('mining_end', 0)
+            mining_time = format_time_remaining(mining_end)
+            
+            if "Mining" in mining_status:
+                msg += f"  ⛏️ <b>Mining:</b> Active (Next claim in {mining_time})\n"
+            elif "Error" in mining_status:
+                msg += f"  ⛏️ <b>Mining:</b> ❌ {mining_status}\n"
+            else:
+                msg += f"  ⛏️ <b>Mining:</b> {mining_status}\n"
+            
+            # Boost Status
+            boost_status = acc.get('boost_status', 'Unknown')
+            boost_end = acc.get('boost_end', 0)
+            boost_time = format_time_remaining(boost_end)
+            
+            if "Tap" in boost_status or "+" in boost_status:
+                msg += f"  🚀 <b>Auto-Tap:</b> Active (Next in {boost_time})\n"
+            elif "Busy" in boost_status or "Cooldown" in boost_status:
+                msg += f"  🚀 <b>Auto-Tap:</b> ⏳ {boost_status} ({boost_time})\n"
+            else:
+                msg += f"  🚀 <b>Auto-Tap:</b> {boost_status}\n"
+            
+            # Task Status
+            task_status = acc.get('task_status', 'Unknown')
+            task_end = acc.get('task_end', 0)
+            task_time = format_time_remaining(task_end)
+            
+            if "Done" in task_status:
+                msg += f"  📋 <b>Tasks:</b> ✅ {task_status}\n"
+            else:
+                msg += f"  📋 <b>Tasks:</b> {task_status} ({task_time})\n"
+            
+            # Proxy info
+            if acc.get('proxy'):
+                msg += f"  🔗 <b>Proxy:</b> {acc['proxy'][:30]}...\n"
+            
+            msg += "\n"
+        
+        # Summary
+        msg += "═" * 30 + "\n"
+        msg += f"<b>📈 Summary:</b>\n"
+        msg += f"  👥 Total Accounts: {len(ACCOUNTS)}\n"
+        msg += f"  💰 Total Balance: {total_balance:.4f} ATF\n"
+        msg += f"  🕐 Last Update: {time.strftime('%H:%M:%S')}"
+        
+        return msg
 
 def format_time_remaining(end_time):
     if end_time <= 0: return "Ready"
     sisa = end_time - time.time()
-    if sisa <= 0: return "Waiting.."
+    if sisa <= 0: return "Ready"
     m, s = divmod(int(sisa), 60)
     h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    elif m > 0:
+        return f"{m}m {s}s"
+    else:
+        return f"{s}s"
 
 def parse_proxy(proxy_str):
     proxy_str = proxy_str.strip()
@@ -200,7 +256,6 @@ def api(session: requests.Session, action: str, acc: dict, extra: dict = None, r
                 session.proxies.update({"http": new_p, "https": new_p})
                 with lock: 
                     acc["mining_status"] = "Proxy Error, Rotating..."
-                    send_status_update(acc, "proxy", f"Proxy error, rotating to new proxy")
             if attempt < retries: time.sleep(5 * attempt)
             else: return None
         except requests.RequestException as e:
@@ -223,6 +278,30 @@ def parse_username(init_data: str) -> str:
         return user.get("username") or user.get("first_name") or "Account"
     except:
         return "Account"
+
+def send_status_update(acc, status_type, message, send_always=False):
+    """Send status update with rate limiting (max once per 30 seconds per account per type)"""
+    if not TELEGRAM_ENABLED:
+        return
+    
+    key = f"{acc['username']}_{status_type}"
+    current_time = time.time()
+    
+    # Rate limit: only send if 30 seconds have passed or send_always is True
+    if not send_always and key in last_telegram_update:
+        if current_time - last_telegram_update[key] < 30:
+            return
+    
+    last_telegram_update[key] = current_time
+    
+    # Format message
+    msg = f"<b>🔄 {status_type.upper()} Update</b>\n"
+    msg += f"<b>Account:</b> {acc['username']}\n"
+    msg += f"<b>Status:</b> {message}\n"
+    msg += f"<b>Balance:</b> {acc.get('balance', '0.0')} ATF\n"
+    msg += f"<b>Time:</b> {time.strftime('%H:%M:%S')}"
+    
+    send_telegram_message(msg)
 
 def process_mining(acc):
     with lock: 
@@ -531,6 +610,101 @@ def worker_thread(acc):
             
         time.sleep(1.0)
 
+# ============================================================
+#  TELEGRAM WEBHOOK / STATUS COMMAND HANDLER
+# ============================================================
+
+@app.route('/', methods=['POST'])
+def webhook():
+    """Handle Telegram webhook updates"""
+    try:
+        update = request.get_json()
+        
+        if not update or 'message' not in update:
+            return 'OK', 200
+        
+        message = update['message']
+        
+        # Check if it's a command
+        if 'text' not in message:
+            return 'OK', 200
+        
+        text = message['text'].strip()
+        chat_id = message['chat']['id']
+        
+        # Only respond to our chat ID
+        if str(chat_id) != str(TELEGRAM_CHAT_ID):
+            return 'OK', 200
+        
+        # Handle /status command
+        if text.lower() == '/status':
+            status_msg = get_status_message()
+            send_telegram_message(status_msg)
+        
+        # Handle /help command
+        elif text.lower() == '/help':
+            help_msg = """<b>🤖 ATF Miners Bot Commands:</b>
+
+/status - Show real-time mining status for all accounts
+/help - Show this help message
+
+<b>Bot Features:</b>
+• Automatic mining every hour
+• Auto-tap every 10 seconds
+• Automatic task completion
+• Real-time balance updates
+• Proxy support for multiple accounts
+
+<b>Status Indicators:</b>
+⛏️ Mining status
+🚀 Auto-tap status
+📋 Task status
+💰 Balance information
+🕐 Time until next action"""
+            send_telegram_message(help_msg)
+        
+        # Handle /start command
+        elif text.lower() == '/start':
+            start_msg = """🚀 <b>ATF Miners Bot is Running!</b>
+
+Use /status to check real-time mining status
+Use /help for available commands
+
+Bot is automatically mining, tapping, and completing tasks for your accounts."""
+            send_telegram_message(start_msg)
+            
+    except Exception as e:
+        print(f"Webhook error: {e}")
+    
+    return 'OK', 200
+
+def run_flask():
+    """Run Flask webhook server"""
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+def set_webhook():
+    """Set the webhook URL for Telegram bot"""
+    if not TELEGRAM_ENABLED or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        return
+    
+    # You need to set this to your public URL
+    # For local testing, use ngrok: https://ngrok.com/
+    webhook_url = "YOUR_PUBLIC_URL_HERE"  # e.g., "https://your-domain.com"
+    
+    if webhook_url == "YOUR_PUBLIC_URL_HERE":
+        print("⚠️  Webhook URL not configured. /status command will use polling instead.")
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+        response = requests.post(url, json={"url": webhook_url})
+        if response.status_code == 200:
+            print(f"✅ Webhook set to: {webhook_url}")
+        else:
+            print(f"❌ Failed to set webhook: {response.text}")
+    except Exception as e:
+        print(f"❌ Webhook error: {e}")
+
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
     print("🚀 ATF Miners Bot")
@@ -541,9 +715,10 @@ def main():
         print("⚠️  Telegram bot not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
         print("   Status updates will only be shown in the terminal dashboard")
     elif TELEGRAM_ENABLED:
-        print(f"✅ Telegram bot enabled! Sending updates to chat ID: {TELEGRAM_CHAT_ID}")
+        print(f"✅ Telegram bot enabled! Chat ID: {TELEGRAM_CHAT_ID}")
+        print("   Send /status to check real-time mining info")
         # Send startup message
-        send_telegram_message("🚀 <b>ATF Miners Bot Started!</b>\nBot is now running and monitoring your accounts.")
+        send_telegram_message("🚀 <b>ATF Miners Bot Started!</b>\n\nBot is now running and monitoring your accounts.\nSend /status to check real-time mining info.")
     
     print("=" * 50)
     
@@ -594,6 +769,12 @@ def main():
 
     # Kosongkan layar sebelum menjalankan UI Live
     os.system("cls" if os.name == "nt" else "clear")
+
+    # Start Flask webhook server in a separate thread
+    if TELEGRAM_ENABLED:
+        flask_thread = Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        print("📡 Telegram webhook server running on port 5000")
 
     # Start worker per account
     for acc in ACCOUNTS:
