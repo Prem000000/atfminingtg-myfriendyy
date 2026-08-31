@@ -14,8 +14,6 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.console import Console
-from flask import Flask, request
-from threading import Thread
 
 # ============================================================
 #  ATF MINERS AUTO BOT (3-COLUMN DASHBOARD VERSION)
@@ -43,32 +41,49 @@ HEADERS_TEMPLATE = {
 # ============================================================
 #  TELEGRAM BOT CONFIGURATION
 # ============================================================
-TELEGRAM_BOT_TOKEN = "8411649204:AAGPnQhIMKKB1rhfoSgGz2ZBtBokNZX1eH4"  # Replace with your bot token
-TELEGRAM_CHAT_ID = "-1003628097142"      # Replace with your chat ID
-TELEGRAM_ENABLED = True                     # Set to False to disable Telegram notifications
+TELEGRAM_BOT_TOKEN = "8411649204:AAGPnQhIMKKB1rhfoSgGz2ZBtBokNZX1eH4"  # Replace with your bot token only!
+TELEGRAM_ENABLED = True
 
 ACCOUNTS = []
 PROXIES_LIST = []
 lock = threading.Lock()
-last_telegram_update = {}  # Track last update time per account to avoid spam
+last_update_id = 0
+authorized_chat_id = None  # Will be auto-detected
 
-# Flask app for webhook
-app = Flask(__name__)
+# ============================================================
+#  PRODUCTION MODE - Auto-detect
+# ============================================================
+def is_production():
+    """Check if running in production environment (no terminal input)"""
+    if not sys.stdin.isatty():
+        return True
+    if os.environ.get('DYNO') or os.environ.get('RAILWAY_ENVIRONMENT'):
+        return True
+    if os.environ.get('KUBERNETES_SERVICE_HOST') or os.environ.get('DOCKER'):
+        return True
+    return False
 
-def send_telegram_message(message, parse_mode="HTML", reply_to=None):
+PRODUCTION_MODE = is_production()
+
+def send_telegram_message(message, parse_mode="HTML"):
     """Send message to Telegram bot"""
+    global authorized_chat_id
+    
     if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        return False
+    
+    # If we don't have a chat ID yet, we can't send
+    if not authorized_chat_id:
+        print("⏳ Waiting for chat ID... (send /start to the bot)")
         return False
     
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": authorized_chat_id,
             "text": message,
             "parse_mode": parse_mode
         }
-        if reply_to:
-            payload["reply_to_message_id"] = reply_to
         response = requests.post(url, json=payload, timeout=10)
         return response.status_code == 200
     except Exception as e:
@@ -85,6 +100,8 @@ def get_status_message():
         msg += "═" * 30 + "\n\n"
         
         total_balance = 0.0
+        mining_active = 0
+        tap_active = 0
         
         for i, acc in enumerate(ACCOUNTS, 1):
             msg += f"<b>👤 Account {i}: {acc['username']}</b>\n"
@@ -92,7 +109,7 @@ def get_status_message():
             # Balance
             balance = float(acc.get('balance', '0.0'))
             total_balance += balance
-            msg += f"  💰 <b>Balance:</b> {balance:.4f} ATF\n"
+            msg += f"  💰 <b>Balance:</b> <code>{balance:.6f}</code> ATF\n"
             
             # Mining Status
             mining_status = acc.get('mining_status', 'Unknown')
@@ -100,7 +117,8 @@ def get_status_message():
             mining_time = format_time_remaining(mining_end)
             
             if "Mining" in mining_status:
-                msg += f"  ⛏️ <b>Mining:</b> Active (Next claim in {mining_time})\n"
+                msg += f"  ⛏️ <b>Mining:</b> ✅ Active (Next claim in <code>{mining_time}</code>)\n"
+                mining_active += 1
             elif "Error" in mining_status:
                 msg += f"  ⛏️ <b>Mining:</b> ❌ {mining_status}\n"
             else:
@@ -112,9 +130,10 @@ def get_status_message():
             boost_time = format_time_remaining(boost_end)
             
             if "Tap" in boost_status or "+" in boost_status:
-                msg += f"  🚀 <b>Auto-Tap:</b> Active (Next in {boost_time})\n"
+                msg += f"  🚀 <b>Auto-Tap:</b> ✅ Active (Next in <code>{boost_time}</code>)\n"
+                tap_active += 1
             elif "Busy" in boost_status or "Cooldown" in boost_status:
-                msg += f"  🚀 <b>Auto-Tap:</b> ⏳ {boost_status} ({boost_time})\n"
+                msg += f"  🚀 <b>Auto-Tap:</b> ⏳ {boost_status}\n"
             else:
                 msg += f"  🚀 <b>Auto-Tap:</b> {boost_status}\n"
             
@@ -126,20 +145,22 @@ def get_status_message():
             if "Done" in task_status:
                 msg += f"  📋 <b>Tasks:</b> ✅ {task_status}\n"
             else:
-                msg += f"  📋 <b>Tasks:</b> {task_status} ({task_time})\n"
+                msg += f"  📋 <b>Tasks:</b> {task_status} (next in <code>{task_time}</code>)\n"
             
             # Proxy info
             if acc.get('proxy'):
-                msg += f"  🔗 <b>Proxy:</b> {acc['proxy'][:30]}...\n"
+                msg += f"  🔗 <b>Proxy:</b> ✅ Connected\n"
             
             msg += "\n"
         
         # Summary
         msg += "═" * 30 + "\n"
-        msg += f"<b>📈 Summary:</b>\n"
-        msg += f"  👥 Total Accounts: {len(ACCOUNTS)}\n"
-        msg += f"  💰 Total Balance: {total_balance:.4f} ATF\n"
-        msg += f"  🕐 Last Update: {time.strftime('%H:%M:%S')}"
+        msg += f"<b>📈 SUMMARY</b>\n"
+        msg += f"  👥 Total Accounts: <b>{len(ACCOUNTS)}</b>\n"
+        msg += f"  ⛏️ Mining Active: <b>{mining_active}</b>\n"
+        msg += f"  🚀 Auto-Tap Active: <b>{tap_active}</b>\n"
+        msg += f"  💰 Total Balance: <b>{total_balance:.6f}</b> ATF\n"
+        msg += f"  🕐 Last Update: <code>{time.strftime('%H:%M:%S')}</code>"
         
         return msg
 
@@ -160,19 +181,15 @@ def parse_proxy(proxy_str):
     proxy_str = proxy_str.strip()
     if not proxy_str: return None
     
-    # Jika sudah menggunakan skema (http://, socks5://, dll)
     if "://" in proxy_str:
         return proxy_str
         
-    # Jika format ip:port:user:pass
     parts = proxy_str.split(":")
     if len(parts) == 4:
         ip, port, user, pw = parts
         return f"http://{user}:{pw}@{ip}:{port}"
-    # Jika format user:pass@ip:port
     elif "@" in proxy_str:
         return f"http://{proxy_str}"
-    # Jika format ip:port
     elif len(parts) == 2:
         ip, port = parts
         return f"http://{ip}:{port}"
@@ -188,19 +205,16 @@ def generate_layout():
             Layout(name="tasks", ratio=1)
         )
         
-        # Kolom Mining
         table_mining = Table(expand=True, show_edge=False)
         table_mining.add_column("Account", style="cyan", width=10, no_wrap=True, overflow="ellipsis")
         table_mining.add_column("Time", style="yellow", width=8, no_wrap=True)
         table_mining.add_column("Mining", style="magenta", no_wrap=True, overflow="ellipsis")
         
-        # Kolom Boost
         table_boost = Table(expand=True, show_edge=False)
         table_boost.add_column("Account", style="cyan", width=10, no_wrap=True, overflow="ellipsis")
         table_boost.add_column("Time", style="yellow", width=8, no_wrap=True)
         table_boost.add_column("Boost", style="red", no_wrap=True, overflow="ellipsis")
         
-        # Kolom Tasks
         table_tasks = Table(expand=True, show_edge=False)
         table_tasks.add_column("Account", style="cyan", width=10, no_wrap=True, overflow="ellipsis")
         table_tasks.add_column("Time", style="yellow", width=8, no_wrap=True)
@@ -211,23 +225,9 @@ def generate_layout():
             rb = format_time_remaining(acc["boost_end"])
             rt = format_time_remaining(acc["task_end"])
             
-            table_mining.add_row(
-                acc["username"], 
-                rm, 
-                acc["mining_status"]
-            )
-            
-            table_boost.add_row(
-                acc["username"], 
-                rb, 
-                acc["boost_status"]
-            )
-            
-            table_tasks.add_row(
-                acc["username"], 
-                rt, 
-                acc["task_status"]
-            )
+            table_mining.add_row(acc["username"], rm, acc["mining_status"])
+            table_boost.add_row(acc["username"], rb, acc["boost_status"])
+            table_tasks.add_row(acc["username"], rt, acc["task_status"])
         
         layout["mining"].update(Panel(table_mining, title="[bold cyan]MONITORING MINING[/]"))
         layout["boost"].update(Panel(table_boost, title="[bold red]MONITORING AUTO-TAP[/]"))
@@ -254,8 +254,7 @@ def api(session: requests.Session, action: str, acc: dict, extra: dict = None, r
                 new_p = random.choice(PROXIES_LIST)
                 acc["proxy"] = new_p
                 session.proxies.update({"http": new_p, "https": new_p})
-                with lock: 
-                    acc["mining_status"] = "Proxy Error, Rotating..."
+                with lock: acc["mining_status"] = "Proxy Error, Rotating..."
             if attempt < retries: time.sleep(5 * attempt)
             else: return None
         except requests.RequestException as e:
@@ -279,34 +278,8 @@ def parse_username(init_data: str) -> str:
     except:
         return "Account"
 
-def send_status_update(acc, status_type, message, send_always=False):
-    """Send status update with rate limiting (max once per 30 seconds per account per type)"""
-    if not TELEGRAM_ENABLED:
-        return
-    
-    key = f"{acc['username']}_{status_type}"
-    current_time = time.time()
-    
-    # Rate limit: only send if 30 seconds have passed or send_always is True
-    if not send_always and key in last_telegram_update:
-        if current_time - last_telegram_update[key] < 30:
-            return
-    
-    last_telegram_update[key] = current_time
-    
-    # Format message
-    msg = f"<b>🔄 {status_type.upper()} Update</b>\n"
-    msg += f"<b>Account:</b> {acc['username']}\n"
-    msg += f"<b>Status:</b> {message}\n"
-    msg += f"<b>Balance:</b> {acc.get('balance', '0.0')} ATF\n"
-    msg += f"<b>Time:</b> {time.strftime('%H:%M:%S')}"
-    
-    send_telegram_message(msg)
-
 def process_mining(acc):
-    with lock: 
-        acc["mining_status"] = "Logging in..."
-        send_status_update(acc, "mining", "Logging in...")
+    with lock: acc["mining_status"] = "Logging in..."
     
     sess = requests.Session()
     sess.headers.update(HEADERS_TEMPLATE)
@@ -315,9 +288,7 @@ def process_mining(acc):
         
     login_res = api(sess, "login", acc)
     if not login_res:
-        with lock: 
-            acc["mining_status"] = "Login Failed (Retrying)"
-            send_status_update(acc, "mining", "❌ Login Failed, retrying...")
+        with lock: acc["mining_status"] = "Login Failed (Retrying)"
         acc["mining_end"] = time.time() + 2
         return
         
@@ -326,9 +297,7 @@ def process_mining(acc):
     
     bal = extract_balance(login_res)
     if bal is not None:
-        with lock: 
-            acc["balance"] = str(bal)
-            send_status_update(acc, "balance", f"💰 Balance updated: {bal} ATF", send_always=True)
+        with lock: acc["balance"] = str(bal)
         
     user_data = login_res.get("user", {})
     if not user_data and "data" in login_res:
@@ -344,7 +313,6 @@ def process_mining(acc):
     wait_secs = 3600.0
     now = time.time()
     
-    # Mining cycle is exactly 1 hour
     if started_at > 0:
         sisa = (started_at + 3600.0) - now
         if sisa > 0:
@@ -358,15 +326,11 @@ def process_mining(acc):
         wait_secs = 0.0
             
     if can_claim:
-        with lock: 
-            acc["mining_status"] = "Claiming Reward..."
-            send_status_update(acc, "mining", "🔄 Claiming mining reward...")
+        with lock: acc["mining_status"] = "Claiming Reward..."
         claim_res = api(sess, "claim", acc)
         time.sleep(2)
         
-        with lock: 
-            acc["mining_status"] = "Solving Captcha..."
-            send_status_update(acc, "mining", "🧩 Solving captcha...")
+        with lock: acc["mining_status"] = "Solving Captcha..."
         tg_id = user_data.get("tg_id", "")
         if not tg_id:
             try:
@@ -387,9 +351,7 @@ def process_mining(acc):
                 start_payload['math_answer'] = ans
             except: pass
         
-        with lock: 
-            acc["mining_status"] = "Starting New Mining..."
-            send_status_update(acc, "mining", "⛏️ Starting new mining cycle...")
+        with lock: acc["mining_status"] = "Starting New Mining..."
         start_res = api(sess, "start_mine", acc, extra=start_payload)
         
         has_error = False
@@ -398,20 +360,14 @@ def process_mining(acc):
         if start_res:
             if start_res.get("status") == "success":
                 wait_secs = 3600.0
-                with lock:
-                    send_status_update(acc, "mining", "✅ Mining started successfully! Next claim in 1 hour")
             else:
                 has_error = True
                 error_msg = start_res.get("message", start_res.get("reason", "Gagal Start"))
                 wait_secs = 60.0
-                with lock:
-                    send_status_update(acc, "mining", f"❌ Mining failed: {error_msg}")
         else:
             has_error = True
             error_msg = "Gagal HTTP Start"
             wait_secs = 60.0
-            with lock:
-                send_status_update(acc, "mining", f"❌ HTTP error starting mining")
             
     with lock: 
         if can_claim and has_error:
@@ -422,9 +378,7 @@ def process_mining(acc):
     sess.close()
 
 def process_boost(acc):
-    with lock: 
-        acc["boost_status"] = "Starting Tap..."
-        send_status_update(acc, "boost", "🔄 Starting auto-tap...")
+    with lock: acc["boost_status"] = "Starting Tap..."
     
     sess = requests.Session()
     sess.headers.update(HEADERS_TEMPLATE)
@@ -436,7 +390,6 @@ def process_boost(acc):
         with lock:
             acc["boost_status"] = "Login Failed"
             acc["boost_end"] = time.time() + 5.0
-            send_status_update(acc, "boost", "❌ Login failed")
         sess.close()
         return
         
@@ -466,8 +419,10 @@ def process_boost(acc):
             wait_time = 10.0
             pending = br.get("pending_reward", 0)
             status_msg = f"+{pending} ATF"
-            with lock:
-                send_status_update(acc, "boost", f"✅ Tap successful! +{pending} ATF")
+            
+            # Send Telegram notification for successful tap
+            if authorized_chat_id:
+                send_telegram_message(f"✅ <b>Tap Successful!</b>\nAccount: {acc['username']}\n+{pending} ATF")
             
             ready_at = br.get("boost_ready_at", 0)
             if ready_at:
@@ -476,21 +431,15 @@ def process_boost(acc):
         elif br.get("status") == "busy":
             status_msg = "Busy (Cooldown)"
             wait_time = 2.0
-            with lock:
-                send_status_update(acc, "boost", "⏳ Busy, cooldown active")
         elif br.get("status") == "cooldown":
             status_msg = "Sistem Cooldown"
             ready_at = br.get("boost_ready_at", 0)
             if ready_at:
                 sisa = ready_at - time.time()
                 if sisa > 0: wait_time = sisa
-            with lock:
-                send_status_update(acc, "boost", f"⏳ Cooldown, ready in {int(wait_time)}s")
     else:
         status_msg = "HTTP Failed"
         wait_time = 5.0
-        with lock:
-            send_status_update(acc, "boost", "❌ HTTP request failed")
         
     with lock:
         acc["boost_status"] = status_msg
@@ -498,21 +447,16 @@ def process_boost(acc):
     sess.close()
 
 def process_tasks(acc):
-    with lock: 
-        acc["task_status"] = "Preparing Tasks..."
-        send_status_update(acc, "tasks", "🔄 Preparing to check tasks...")
+    with lock: acc["task_status"] = "Preparing Tasks..."
     
     sess = requests.Session()
     sess.headers.update(HEADERS_TEMPLATE)
     if acc.get("proxy"):
         sess.proxies.update({"http": acc["proxy"], "https": acc["proxy"]})
     
-    # Login to get valid token
     login_res = api(sess, "login", acc, retries=1)
     if not login_res:
-        with lock: 
-            acc["task_status"] = "Login failed, retrying..."
-            send_status_update(acc, "tasks", "❌ Login failed")
+        with lock: acc["task_status"] = "Login failed, retrying..."
         acc["task_end"] = time.time() + 2
         return
         
@@ -528,9 +472,7 @@ def process_tasks(acc):
         tg_id = ""
         
     if not tg_id:
-        with lock: 
-            acc["task_status"] = "Failed parsing TG ID"
-            send_status_update(acc, "tasks", "❌ Failed to parse Telegram ID")
+        with lock: acc["task_status"] = "Failed parsing TG ID"
         acc["task_end"] = time.time() + 60.0
         return
         
@@ -546,21 +488,15 @@ def process_tasks(acc):
     ]
     
     start_count = 0
-    claimed_tasks = []
     
     for tid in task_ids:
         if tid in completed_tasks:
             continue
             
-        with lock: 
-            acc["task_status"] = f"Start: {tid}"
-            send_status_update(acc, "tasks", f"🔄 Starting task: {tid}")
+        with lock: acc["task_status"] = f"Start: {tid}"
         sr = api(sess, "start_task", acc, extra={"tg_id": tg_id, "task_id": tid}, retries=1)
         
-        # Selalu coba claim, baik start-nya success maupun sudah pernah di-start (cooldown)
-        with lock: 
-            acc["task_status"] = f"Claim: {tid}"
-            send_status_update(acc, "tasks", f"🔄 Claiming task: {tid}")
+        with lock: acc["task_status"] = f"Claim: {tid}"
         cr = api(sess, "claim_task", acc, extra={
             "tg_id": tg_id, 
             "task_id": tid, 
@@ -571,139 +507,125 @@ def process_tasks(acc):
         if cr and cr.get("status") == "success":
             start_count += 1
             completed_tasks.append(tid)
-            claimed_tasks.append(tid)
-            with lock:
-                send_status_update(acc, "tasks", f"✅ Task completed: {tid}")
             
         time.sleep(1)
             
     with lock:
         acc["task_status"] = f"Done (+{start_count} Claimed)"
         acc["task_end"] = time.time() + 60.0
-        if start_count > 0:
-            send_status_update(acc, "tasks", f"✅ Completed {start_count} tasks: {', '.join(claimed_tasks)}", send_always=True)
 
 def worker_thread(acc):
-    time.sleep(random.uniform(0.5, 5.0)) # Stagger thread starts
-    
-    # Send initial status
-    with lock:
-        send_status_update(acc, "start", "🚀 Bot started successfully!", send_always=True)
-    
+    time.sleep(random.uniform(0.5, 5.0))
     while True:
         now = time.time()
         
-        # 1. Prioritaskan Mining
         if now >= acc["mining_end"]:
             process_mining(acc)
-            continue # Kembali ke awal loop
+            continue
         
-        # 2. Prioritaskan Boost
         if now >= acc["boost_end"]:
             process_boost(acc)
             continue
             
-        # 3. Terakhir Task
         if now >= acc["task_end"]:
             process_tasks(acc)
             continue
             
         time.sleep(1.0)
 
-# ============================================================
-#  TELEGRAM WEBHOOK / STATUS COMMAND HANDLER
-# ============================================================
-
-@app.route('/', methods=['POST'])
-def webhook():
-    """Handle Telegram webhook updates"""
-    try:
-        update = request.get_json()
-        
-        if not update or 'message' not in update:
-            return 'OK', 200
-        
-        message = update['message']
-        
-        # Check if it's a command
-        if 'text' not in message:
-            return 'OK', 200
-        
-        text = message['text'].strip()
-        chat_id = message['chat']['id']
-        
-        # Only respond to our chat ID
-        if str(chat_id) != str(TELEGRAM_CHAT_ID):
-            return 'OK', 200
-        
-        # Handle /status command
-        if text.lower() == '/status':
-            status_msg = get_status_message()
-            send_telegram_message(status_msg)
-        
-        # Handle /help command
-        elif text.lower() == '/help':
-            help_msg = """<b>🤖 ATF Miners Bot Commands:</b>
+def handle_message(message):
+    """Handle incoming Telegram messages"""
+    global authorized_chat_id
+    
+    if 'text' not in message:
+        return
+    
+    text = message['text'].strip()
+    chat_id = message['chat']['id']
+    
+    # Auto-authorize the first person who messages the bot
+    if not authorized_chat_id:
+        authorized_chat_id = chat_id
+        print(f"✅ Authorized chat ID: {authorized_chat_id}")
+        send_telegram_message("🚀 <b>ATF Miners Bot Authorized!</b>\n\nSend /status to check real-time mining info\nSend /help for available commands")
+        return
+    
+    # Only respond to authorized chat ID
+    if chat_id != authorized_chat_id:
+        return
+    
+    # Handle /status command
+    if text.lower() == '/status':
+        status_msg = get_status_message()
+        send_telegram_message(status_msg)
+    
+    # Handle /help command
+    elif text.lower() == '/help':
+        help_msg = """<b>🤖 ATF Miners Bot Commands:</b>
 
 /status - Show real-time mining status for all accounts
 /help - Show this help message
+/start - Show bot info
 
 <b>Bot Features:</b>
-• Automatic mining every hour
-• Auto-tap every 10 seconds
-• Automatic task completion
-• Real-time balance updates
-• Proxy support for multiple accounts
+• ⛏️ Auto-mining every hour
+• 🚀 Auto-tap every 10 seconds  
+• 📋 Auto-task completion
+• 💰 Real-time balance updates
 
-<b>Status Indicators:</b>
-⛏️ Mining status
-🚀 Auto-tap status
-📋 Task status
-💰 Balance information
-🕐 Time until next action"""
-            send_telegram_message(help_msg)
-        
-        # Handle /start command
-        elif text.lower() == '/start':
-            start_msg = """🚀 <b>ATF Miners Bot is Running!</b>
+<b>Status Info:</b>
+• Balance in ATF
+• Mining status & countdown
+• Auto-tap status & countdown
+• Task completion status"""
+        send_telegram_message(help_msg)
+    
+    # Handle /start command
+    elif text.lower() == '/start':
+        start_msg = """🚀 <b>ATF Miners Bot is Active!</b>
+
+📊 <b>Status:</b> Running
+👥 <b>Accounts:</b> {count} account(s)
 
 Use /status to check real-time mining status
 Use /help for available commands
 
-Bot is automatically mining, tapping, and completing tasks for your accounts."""
-            send_telegram_message(start_msg)
+Bot is automatically mining, tapping, and completing tasks!""".format(count=len(ACCOUNTS))
+        send_telegram_message(start_msg)
+
+def polling_loop():
+    """Poll Telegram for updates"""
+    global last_update_id
+    print("📡 Started polling for Telegram commands...")
+    print("💬 Send /start to your bot to authorize and start receiving updates")
+    
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {
+                "timeout": 30,
+                "offset": last_update_id + 1,
+                "allowed_updates": ["message"]
+            }
+            response = requests.get(url, json=params, timeout=35)
             
-    except Exception as e:
-        print(f"Webhook error: {e}")
-    
-    return 'OK', 200
-
-def run_flask():
-    """Run Flask webhook server"""
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-
-def set_webhook():
-    """Set the webhook URL for Telegram bot"""
-    if not TELEGRAM_ENABLED or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        return
-    
-    # You need to set this to your public URL
-    # For local testing, use ngrok: https://ngrok.com/
-    webhook_url = "YOUR_PUBLIC_URL_HERE"  # e.g., "https://your-domain.com"
-    
-    if webhook_url == "YOUR_PUBLIC_URL_HERE":
-        print("⚠️  Webhook URL not configured. /status command will use polling instead.")
-        return
-    
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-        response = requests.post(url, json={"url": webhook_url})
-        if response.status_code == 200:
-            print(f"✅ Webhook set to: {webhook_url}")
-        else:
-            print(f"❌ Failed to set webhook: {response.text}")
-    except Exception as e:
-        print(f"❌ Webhook error: {e}")
+            if response.status_code == 200:
+                updates = response.json()
+                
+                for update in updates.get('result', []):
+                    last_update_id = update['update_id']
+                    if 'message' in update:
+                        handle_message(update['message'])
+            else:
+                print(f"Polling error: {response.status_code}")
+                
+        except requests.exceptions.Timeout:
+            pass
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(5)
+        
+        time.sleep(1)
 
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -711,35 +633,40 @@ def main():
     print("=" * 50)
     
     # Check Telegram configuration
-    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
-        print("⚠️  Telegram bot not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("⚠️  Telegram bot not configured. Set TELEGRAM_BOT_TOKEN")
         print("   Status updates will only be shown in the terminal dashboard")
-    elif TELEGRAM_ENABLED:
-        print(f"✅ Telegram bot enabled! Chat ID: {TELEGRAM_CHAT_ID}")
-        print("   Send /status to check real-time mining info")
-        # Send startup message
-        send_telegram_message("🚀 <b>ATF Miners Bot Started!</b>\n\nBot is now running and monitoring your accounts.\nSend /status to check real-time mining info.")
+        TELEGRAM_ENABLED = False
+    else:
+        print(f"✅ Telegram bot enabled!")
+        print("   Send /start to your bot to authorize")
     
     print("=" * 50)
     
-    use_proxy = input("Use proxies from proxies.txt? (y/n): ").strip().lower()
+    # Auto-load proxies
     proxies_list = []
+    if os.path.exists("proxies.txt"):
+        with open("proxies.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                p = parse_proxy(line)
+                if p: 
+                    proxies_list.append(p)
+                    PROXIES_LIST.append(p)
+        print(f"[+] Loaded {len(proxies_list)} proxies automatically.")
+    else:
+        print("[!] No proxies.txt found, running without proxies.")
     
-    if use_proxy == 'y':
-        if os.path.exists("proxies.txt"):
-            with open("proxies.txt", "r", encoding="utf-8") as f:
-                for line in f:
-                    p = parse_proxy(line)
-                    if p: 
-                        proxies_list.append(p)
-                        PROXIES_LIST.append(p)
-            print(f"[+] Found {len(proxies_list)} proxies.")
-        else:
-            print("[-] File proxies.txt tidak ditemukan, berjalan tanpa proxies.")
-            time.sleep(2)
-            
+    # Load queries
+    if not os.path.exists("query.txt"):
+        print("❌ query.txt not found!")
+        sys.exit(1)
+        
     with open("query.txt", "r", encoding="utf-8") as f:
         queries = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    
+    if not queries:
+        print("❌ query.txt is empty!")
+        sys.exit(1)
     
     for i, q in enumerate(queries):
         proxy = proxies_list[i % len(proxies_list)] if proxies_list else None
@@ -757,40 +684,37 @@ def main():
             "boost_end": 0
         })
         
-    if not ACCOUNTS:
-        print("query.txt kosong!")
-        sys.exit(1)
+    print(f"[+] Loaded {len(ACCOUNTS)} account(s)")
+    print("=" * 50)
 
-    # Send account info to Telegram
+    # Start Telegram polling thread
     if TELEGRAM_ENABLED:
-        account_list = "\n".join([f"• {acc['username']}" for acc in ACCOUNTS])
-        msg = f"📊 <b>Loaded {len(ACCOUNTS)} account(s):</b>\n{account_list}"
-        send_telegram_message(msg)
-
-    # Kosongkan layar sebelum menjalankan UI Live
-    os.system("cls" if os.name == "nt" else "clear")
-
-    # Start Flask webhook server in a separate thread
-    if TELEGRAM_ENABLED:
-        flask_thread = Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        print("📡 Telegram webhook server running on port 5000")
+        polling_thread = threading.Thread(target=polling_loop, daemon=True)
+        polling_thread.start()
 
     # Start worker per account
     for acc in ACCOUNTS:
         t = threading.Thread(target=worker_thread, args=(acc,), daemon=True)
         t.start()
 
-    # Start UI
-    try:
-        with Live(generate_layout(), refresh_per_second=2) as live:
+    # Start UI (skip in production to avoid rich library issues)
+    if not PRODUCTION_MODE:
+        try:
+            with Live(generate_layout(), refresh_per_second=2) as live:
+                while True:
+                    live.update(generate_layout())
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n🛑 Bot stopped by user")
+            sys.exit(0)
+    else:
+        print("🔄 Bot running in production mode...")
+        try:
             while True:
-                live.update(generate_layout())
-                time.sleep(0.5)
-    except KeyboardInterrupt:
-        if TELEGRAM_ENABLED:
-            send_telegram_message("🛑 <b>Bot Stopped</b>\nBot has been stopped by user.")
-        sys.exit(0)
+                time.sleep(10)
+        except KeyboardInterrupt:
+            print("\n🛑 Bot stopped by user")
+            sys.exit(0)
 
 if __name__ == "__main__":
     main()
