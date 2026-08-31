@@ -8,6 +8,7 @@ import urllib.parse
 import uuid
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
@@ -16,7 +17,7 @@ from rich.text import Text
 from rich.console import Console
 
 # ============================================================
-#  ATF MINERS AUTO BOT (3-COLUMN DASHBOARD VERSION)
+#  ATF MINERS AUTO BOT (OPTIMIZED FAST VERSION)
 # ============================================================
 
 BASE_URL   = "https://atfminers.asloni.online/miner/index.php"
@@ -49,7 +50,7 @@ PROXIES_LIST = []
 lock = threading.Lock()
 last_update_id = 0
 authorized_chat_id = None
-last_debug_log = {}
+executor = ThreadPoolExecutor(max_workers=20)  # For parallel execution
 
 # ============================================================
 #  PRODUCTION MODE - Auto-detect
@@ -64,25 +65,6 @@ def is_production():
     return False
 
 PRODUCTION_MODE = is_production()
-
-def log_debug(acc, action, message, response=None):
-    """Log debug information"""
-    timestamp = time.strftime('%H:%M:%S')
-    key = f"{acc['username']}_{action}"
-    
-    log_entry = {
-        'time': timestamp,
-        'message': message,
-        'response': response
-    }
-    
-    with lock:
-        last_debug_log[key] = log_entry
-    
-    # Print to console
-    print(f"[{timestamp}] {acc['username']} - {action}: {message}")
-    if response and isinstance(response, dict):
-        print(f"  Response: {json.dumps(response, indent=2)[:500]}")
 
 def send_telegram_message(message, parse_mode="HTML"):
     global authorized_chat_id
@@ -100,7 +82,7 @@ def send_telegram_message(message, parse_mode="HTML"):
             "text": message,
             "parse_mode": parse_mode
         }
-        response = requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=5)
         return response.status_code == 200
     except Exception as e:
         print(f"Failed to send Telegram message: {e}")
@@ -144,8 +126,6 @@ def get_status_message():
             if "Tap" in boost_status or "+" in boost_status:
                 msg += f"  🚀 <b>Auto-Tap:</b> ✅ Active (Next in <code>{boost_time}</code>)\n"
                 tap_active += 1
-            elif "Busy" in boost_status or "Cooldown" in boost_status:
-                msg += f"  🚀 <b>Auto-Tap:</b> ⏳ {boost_status}\n"
             else:
                 msg += f"  🚀 <b>Auto-Tap:</b> {boost_status}\n"
             
@@ -156,14 +136,7 @@ def get_status_message():
             if "Done" in task_status:
                 msg += f"  📋 <b>Tasks:</b> ✅ {task_status}\n"
             else:
-                msg += f"  📋 <b>Tasks:</b> {task_status} (next in <code>{task_time}</code>)\n"
-            
-            if acc.get('proxy'):
-                msg += f"  🔗 <b>Proxy:</b> ✅ Connected\n"
-            
-            # Show query info (first 50 chars)
-            query_preview = acc.get('query', '')[:50] + '...' if len(acc.get('query', '')) > 50 else acc.get('query', '')
-            msg += f"  📝 <b>Query:</b> <code>{query_preview}</code>\n"
+                msg += f"  📋 <b>Tasks:</b> {task_status}\n"
             
             msg += "\n"
         
@@ -247,63 +220,30 @@ def generate_layout():
         layout["tasks"].update(Panel(table_tasks, title="[bold green]MONITORING TASKS[/]"))
         return layout
 
-def api(session: requests.Session, action: str, acc: dict, extra: dict = None, retries: int = 3):
+def api(session: requests.Session, action: str, acc: dict, extra: dict = None, retries: int = 2):
     url = f"{BASE_URL}?action={action}&t={int(time.time() * 1000)}"
     payload = {"initData": acc["query"]}
     if extra: payload.update(extra)
 
-    log_debug(acc, action, f"Sending request to {action}", payload)
-
     for attempt in range(1, retries + 1):
         try:
-            r = session.post(url, json=payload, timeout=30)
+            r = session.post(url, json=payload, timeout=10)
             r.raise_for_status()
             try: 
-                response = r.json()
-                log_debug(acc, action, f"Response received (attempt {attempt})", response)
-                
-                # Check if response indicates invalid query
-                if response.get('status') == 'error' and 'query' in response.get('message', '').lower():
-                    log_debug(acc, action, "⚠️ Query appears to be invalid/expired!", response)
-                    
-                return response
+                return r.json()
             except: 
                 return {"raw": r.text}
-        except requests.exceptions.HTTPError as e:
-            try: 
-                response = r.json()
-                log_debug(acc, action, f"HTTP Error: {e}", response)
-                return response
-            except: 
-                pass
+        except:
             if attempt < retries: 
-                time.sleep(3)
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.ProxyError) as e:
-            log_debug(acc, action, f"Connection error: {e}")
-            if PROXIES_LIST:
-                new_p = random.choice(PROXIES_LIST)
-                acc["proxy"] = new_p
-                session.proxies.update({"http": new_p, "https": new_p})
-                with lock: 
-                    acc["mining_status"] = "Proxy Error, Rotating..."
-            if attempt < retries: 
-                time.sleep(5 * attempt)
-            else: 
-                return None
-        except requests.RequestException as e:
-            log_debug(acc, action, f"Request error: {e}")
-            if attempt < retries: 
-                time.sleep(5 * attempt)
+                time.sleep(0.5)
             else: 
                 return None
     return None
 
 def extract_balance(d):
-    """Extract balance from API response"""
     if not isinstance(d, dict): 
         return None
     
-    # Try different paths where balance might be
     balance_paths = [
         "mined_balance",
         "balance", 
@@ -343,7 +283,6 @@ def parse_username(init_data: str) -> str:
         return "Account"
 
 def get_tg_id(acc):
-    """Extract tg_id from query"""
     try:
         parsed = dict(urllib.parse.parse_qsl(acc["query"]))
         user_str = parsed.get("user", "{}")
@@ -353,7 +292,6 @@ def get_tg_id(acc):
         return ""
 
 def update_balance_from_response(acc, response):
-    """Update account balance from API response"""
     if not response:
         return False
     
@@ -369,48 +307,44 @@ def update_balance_from_response(acc, response):
     
     return False
 
-def process_mining(acc):
+def fast_login(session, acc):
+    """Fast login with minimal delay"""
+    login_res = api(session, "login", acc, retries=1)
+    if not login_res or login_res.get('status') == 'error':
+        return None
+    
+    token = login_res.get("token") or (login_res.get("data") or {}).get("token")
+    if token:
+        session.headers.update({"Authorization": f"Bearer {token}"})
+    
+    update_balance_from_response(acc, login_res)
+    return login_res
+
+def process_mining_fast(acc):
+    """Optimized mining - runs less frequently"""
     with lock: 
-        acc["mining_status"] = "Logging in..."
+        acc["mining_status"] = "Mining..."
     
     sess = requests.Session()
     sess.headers.update(HEADERS_TEMPLATE)
     if acc.get("proxy"):
         sess.proxies.update({"http": acc["proxy"], "https": acc["proxy"]})
-        
-    # Login
-    login_res = api(sess, "login", acc)
+    
+    login_res = fast_login(sess, acc)
     if not login_res:
-        with lock: 
-            acc["mining_status"] = "Login Failed - Check Query"
-            acc["mining_end"] = time.time() + 60  # Wait longer if query is invalid
+        with lock:
+            acc["mining_status"] = "Login Error"
+            acc["mining_end"] = time.time() + 60
         sess.close()
         return
-        
-    # Check if login was successful
-    if login_res.get('status') == 'error':
-        error_msg = login_res.get('message', 'Unknown error')
-        with lock: 
-            acc["mining_status"] = f"Login Error: {error_msg[:30]}"
-            acc["mining_end"] = time.time() + 120  # Wait longer on error
-        sess.close()
-        return
-        
-    token = login_res.get("token") or (login_res.get("data") or {}).get("token")
-    if token: 
-        sess.headers.update({"Authorization": f"Bearer {token}"})
     
-    # Update balance from login
-    update_balance_from_response(acc, login_res)
+    tg_id = get_tg_id(acc)
     
-    # Get user data
+    # Check if mining is already running
     user_data = login_res.get("user", {})
     if not user_data and "data" in login_res:
         user_data = login_res["data"].get("user", {})
     
-    tg_id = get_tg_id(acc)
-    
-    # Check mining status
     mining_start = user_data.get("mining_cycle_started_at") or user_data.get("last_mining_start") or 0
     try:
         mining_start = float(mining_start)
@@ -419,36 +353,22 @@ def process_mining(acc):
     
     now = time.time()
     
-    # If mining is active and not finished, wait
     if mining_start > 0:
-        mining_end = mining_start + 3600  # 1 hour mining cycle
+        mining_end = mining_start + 3600
         if now < mining_end:
-            wait_time = mining_end - now
             with lock:
                 acc["mining_status"] = f"Mining ({acc['balance']} ATF)"
-                acc["mining_end"] = now + max(wait_time, 10)
+                acc["mining_end"] = mining_end
             sess.close()
             return
     
-    # Claim and start new mining
-    with lock: 
-        acc["mining_status"] = "Claiming Reward..."
+    # Fast claim and restart
+    claim_res = api(sess, "claim", acc, retries=1)
+    time.sleep(0.3)
     
-    # Claim reward
-    claim_res = api(sess, "claim", acc)
-    if claim_res:
-        update_balance_from_response(acc, claim_res)
-    time.sleep(1)
-    
-    # Solve captcha
-    with lock: 
-        acc["mining_status"] = "Solving Captcha..."
-    
-    challenge_res = api(sess, "get_math_challenge", acc, extra={'tg_id': tg_id, 'scope': 'start_mine'})
-    start_payload = {
-        'tg_id': tg_id,
-        'request_id': str(uuid.uuid4())
-    }
+    # Get captcha
+    challenge_res = api(sess, "get_math_challenge", acc, extra={'tg_id': tg_id, 'scope': 'start_mine'}, retries=1)
+    start_payload = {'tg_id': tg_id, 'request_id': str(uuid.uuid4())}
     
     if challenge_res and challenge_res.get("status") == "success":
         try:
@@ -457,30 +377,25 @@ def process_mining(acc):
             ans = str(eval(q_str))
             start_payload['math_challenge_id'] = cid
             start_payload['math_answer'] = ans
-        except Exception as e:
-            print(f"Captcha error: {e}")
+        except:
+            pass
     
-    # Start mining
-    with lock: 
-        acc["mining_status"] = "Starting New Mining..."
-    
-    start_res = api(sess, "start_mine", acc, extra=start_payload)
+    start_res = api(sess, "start_mine", acc, extra=start_payload, retries=1)
     
     if start_res and start_res.get("status") == "success":
         update_balance_from_response(acc, start_res)
-        
         with lock:
             acc["mining_status"] = f"Mining ({acc['balance']} ATF)"
-            acc["mining_end"] = time.time() + 3600  # 1 hour
+            acc["mining_end"] = time.time() + 3600
     else:
-        error_msg = start_res.get("message", start_res.get("reason", "Unknown error")) if start_res else "HTTP Error"
         with lock:
-            acc["mining_status"] = f"Error: {error_msg}"
+            acc["mining_status"] = "Mining Error"
             acc["mining_end"] = time.time() + 60
     
     sess.close()
 
-def process_boost(acc):
+def process_boost_fast(acc):
+    """Super fast tapping - minimal delays"""
     with lock: 
         acc["boost_status"] = "Tapping..."
     
@@ -489,169 +404,112 @@ def process_boost(acc):
     if acc.get("proxy"):
         sess.proxies.update({"http": acc["proxy"], "https": acc["proxy"]})
     
-    # Login
-    login_res = api(sess, "login", acc, retries=1)
+    # Quick login
+    login_res = fast_login(sess, acc)
     if not login_res:
         with lock:
-            acc["boost_status"] = "Login Failed"
-            acc["boost_end"] = time.time() + 60
+            acc["boost_status"] = "Login Error"
+            acc["boost_end"] = time.time() + 2
         sess.close()
         return
-    
-    if login_res.get('status') == 'error':
-        error_msg = login_res.get('message', 'Unknown error')
-        with lock:
-            acc["boost_status"] = f"Error: {error_msg[:20]}"
-            acc["boost_end"] = time.time() + 120
-        sess.close()
-        return
-    
-    token = login_res.get("token") or (login_res.get("data") or {}).get("token")
-    if token: 
-        sess.headers.update({"Authorization": f"Bearer {token}"})
-    
-    # Update balance from login
-    update_balance_from_response(acc, login_res)
     
     tg_id = get_tg_id(acc)
     
-    # Prepare boost/tap payload
+    # Fast tap payload
     payload = {
         "tg_id": tg_id,
         "request_id": str(uuid.uuid4()),
         "display_preview": round(random.uniform(0.24, 0.35), 4)
     }
     
-    # Call activate_boost (this is the tap action)
-    boost_res = api(sess, "activate_boost", acc, extra=payload, retries=2)
+    # Execute tap with minimal timeout
+    boost_res = api(sess, "activate_boost", acc, extra=payload, retries=1)
     
     if boost_res:
         if boost_res.get("status") == "success":
             pending = boost_res.get("pending_reward", 0)
-            
-            # Update balance from the actual API response
             new_balance = extract_balance(boost_res)
             
             if new_balance is not None:
                 with lock:
                     acc["balance"] = f"{float(new_balance):.6f}"
-                    current_balance = acc["balance"]
-                    
-                    if authorized_chat_id:
-                        send_telegram_message(
-                            f"✅ <b>Tap Successful!</b>\n"
-                            f"Account: {acc['username']}\n"
-                            f"+{pending} ATF\n"
-                            f"Balance: {current_balance} ATF"
-                        )
-                    
                     acc["boost_status"] = f"+{pending} ATF"
             else:
-                # If balance not in response, use pending reward to update
-                try:
-                    current_balance = float(acc.get('balance', '0.0'))
-                    new_balance = current_balance + float(pending)
-                    with lock:
-                        acc["balance"] = f"{new_balance:.6f}"
-                        if authorized_chat_id:
-                            send_telegram_message(
-                                f"✅ <b>Tap Successful!</b>\n"
-                                f"Account: {acc['username']}\n"
-                                f"+{pending} ATF\n"
-                                f"Balance: {acc['balance']} ATF"
-                            )
-                        acc["boost_status"] = f"+{pending} ATF"
-                except:
-                    with lock:
-                        acc["boost_status"] = f"+{pending} ATF"
+                with lock:
+                    acc["boost_status"] = f"+{pending} ATF"
             
-            # Check boost_ready_at for cooldown
+            # Calculate next tap time (2-3 seconds)
             ready_at = boost_res.get("boost_ready_at", 0)
             if ready_at:
                 try:
                     wait_time = float(ready_at) - time.time()
-                    wait_time = max(wait_time, 2)
+                    wait_time = max(wait_time, 0.5)
                 except:
-                    wait_time = 10
+                    wait_time = 2
             else:
-                wait_time = 10
+                wait_time = 2
                 
             with lock:
-                acc["boost_end"] = time.time() + max(wait_time, 2)
-                
+                acc["boost_end"] = time.time() + max(wait_time, 0.5)
+        
         elif boost_res.get("status") == "cooldown":
             ready_at = boost_res.get("boost_ready_at", 0)
             if ready_at:
                 try:
                     wait_time = float(ready_at) - time.time()
-                    wait_time = max(wait_time, 2)
+                    wait_time = max(wait_time, 0.5)
                 except:
-                    wait_time = 10
+                    wait_time = 2
             else:
-                wait_time = 10
+                wait_time = 2
                 
             with lock:
-                acc["boost_status"] = f"Cooldown ({int(wait_time)}s)"
-                acc["boost_end"] = time.time() + max(wait_time, 2)
-                
+                acc["boost_status"] = f"Cooldown"
+                acc["boost_end"] = time.time() + max(wait_time, 0.5)
+        
         elif boost_res.get("status") == "busy":
             with lock:
-                acc["boost_status"] = "Busy, retrying..."
-                acc["boost_end"] = time.time() + 3
+                acc["boost_status"] = "Busy"
+                acc["boost_end"] = time.time() + 1
+        
         else:
-            error_msg = boost_res.get("message", "Unknown error")
             with lock:
-                acc["boost_status"] = f"Error: {error_msg}"
-                acc["boost_end"] = time.time() + 5
+                acc["boost_status"] = "Error"
+                acc["boost_end"] = time.time() + 1
     else:
         with lock:
-            acc["boost_status"] = "HTTP Failed"
-            acc["boost_end"] = time.time() + 5
+            acc["boost_status"] = "Failed"
+            acc["boost_end"] = time.time() + 1
     
     sess.close()
 
-def process_tasks(acc):
+def process_tasks_fast(acc):
+    """Fast task processing"""
     with lock: 
-        acc["task_status"] = "Preparing Tasks..."
+        acc["task_status"] = "Tasks..."
     
     sess = requests.Session()
     sess.headers.update(HEADERS_TEMPLATE)
     if acc.get("proxy"):
         sess.proxies.update({"http": acc["proxy"], "https": acc["proxy"]})
     
-    # Login
-    login_res = api(sess, "login", acc, retries=1)
+    login_res = fast_login(sess, acc)
     if not login_res:
-        with lock: 
-            acc["task_status"] = "Login failed"
-            acc["task_end"] = time.time() + 60
-        sess.close()
-        return
-    
-    if login_res.get('status') == 'error':
-        error_msg = login_res.get('message', 'Unknown error')
         with lock:
-            acc["task_status"] = f"Error: {error_msg[:20]}"
-            acc["task_end"] = time.time() + 120
+            acc["task_status"] = "Login Error"
+            acc["task_end"] = time.time() + 30
         sess.close()
         return
-    
-    token = login_res.get("token") or (login_res.get("data") or {}).get("token")
-    if token: 
-        sess.headers.update({"Authorization": f"Bearer {token}"})
-    
-    # Update balance
-    update_balance_from_response(acc, login_res)
     
     tg_id = get_tg_id(acc)
     if not tg_id:
-        with lock: 
+        with lock:
             acc["task_status"] = "No TG ID"
             acc["task_end"] = time.time() + 60
         sess.close()
         return
     
-    # Get completed tasks from user data
+    # Get completed tasks
     user_data = login_res.get("user", {})
     if not user_data and "data" in login_res:
         user_data = login_res["data"].get("user", {})
@@ -675,16 +533,9 @@ def process_tasks(acc):
         if tid in completed_tasks:
             continue
         
-        with lock: 
-            acc["task_status"] = f"Starting: {tid}"
-        
-        # Start task
+        # Quick start and claim
         start_res = api(sess, "start_task", acc, extra={"tg_id": tg_id, "task_id": tid}, retries=1)
-        time.sleep(1)
-        
-        # Claim task
-        with lock: 
-            acc["task_status"] = f"Claiming: {tid}"
+        time.sleep(0.2)
         
         claim_res = api(sess, "claim_task", acc, extra={
             "tg_id": tg_id, 
@@ -698,43 +549,58 @@ def process_tasks(acc):
             completed_tasks.append(tid)
             update_balance_from_response(acc, claim_res)
         
-        time.sleep(1)
+        time.sleep(0.3)
     
     with lock:
         acc["task_status"] = f"Done (+{start_count})"
-        acc["task_end"] = time.time() + 120  # 2 minutes
+        acc["task_end"] = time.time() + 60
     
     sess.close()
 
 def worker_thread(acc):
-    # Initialize with immediate first run
-    time.sleep(random.uniform(0.5, 3.0))
+    """Optimized worker with fast tapping"""
+    time.sleep(random.uniform(0.1, 1.0))
     
-    # Set initial times to run immediately
+    # Set initial times
     with lock:
-        acc["mining_end"] = 0
-        acc["boost_end"] = 0
-        acc["task_end"] = time.time() + 30
+        acc["mining_end"] = time.time() + 5
+        acc["boost_end"] = time.time() + 1
+        acc["task_end"] = time.time() + 10
+    
+    tap_count = 0
+    last_status_update = 0
     
     while True:
         now = time.time()
         
-        # Check and run mining (every hour)
+        # Mining - check less frequently
         if now >= acc["mining_end"]:
-            process_mining(acc)
+            process_mining_fast(acc)
             continue
         
-        # Check and run boost/tap (every 10-15 seconds)
+        # BOOST/TAP - Run as fast as possible (every 1-2 seconds)
         if now >= acc["boost_end"]:
-            process_boost(acc)
+            process_boost_fast(acc)
+            tap_count += 1
+            
+            # Send status update every 10 taps
+            if tap_count % 10 == 0 and authorized_chat_id:
+                with lock:
+                    send_telegram_message(
+                        f"⚡ <b>Fast Tapping!</b>\n"
+                        f"Account: {acc['username']}\n"
+                        f"Taps: {tap_count}\n"
+                        f"Balance: {acc['balance']} ATF"
+                    )
             continue
         
-        # Check and run tasks (every 2 minutes)
+        # Tasks - run every minute
         if now >= acc["task_end"]:
-            process_tasks(acc)
+            process_tasks_fast(acc)
             continue
         
-        time.sleep(0.5)
+        # Minimal sleep (0.1 seconds for fast response)
+        time.sleep(0.1)
 
 def handle_message(message):
     global authorized_chat_id
@@ -748,7 +614,7 @@ def handle_message(message):
     if not authorized_chat_id:
         authorized_chat_id = chat_id
         print(f"✅ Authorized chat ID: {authorized_chat_id}")
-        send_telegram_message("🚀 <b>ATF Miners Bot Authorized!</b>\n\nSend /status to check real-time mining info\nSend /help for available commands")
+        send_telegram_message("🚀 <b>ATF Miners Bot Authorized!</b>\n\n⚡ <b>Turbo Mode Enabled!</b>\nTapping every 1-2 seconds!\n\nSend /status to check progress")
         return
     
     if chat_id != authorized_chat_id:
@@ -758,48 +624,38 @@ def handle_message(message):
         status_msg = get_status_message()
         send_telegram_message(status_msg)
     
-    elif text.lower() == '/debug':
-        # Send debug info
-        debug_msg = "🔍 <b>Debug Information</b>\n\n"
-        for acc in ACCOUNTS:
-            debug_msg += f"<b>{acc['username']}</b>\n"
-            debug_msg += f"Query: {acc.get('query', '')[:100]}...\n"
-            debug_msg += f"Proxy: {acc.get('proxy', 'None')}\n"
-            debug_msg += f"Balance: {acc.get('balance', '0.0')}\n\n"
-        send_telegram_message(debug_msg)
-    
     elif text.lower() == '/help':
-        help_msg = """<b>🤖 ATF Miners Bot Commands:</b>
+        help_msg = """<b>🤖 ATF Miners Bot - Turbo Mode</b>
 
 /status - Show real-time mining status
-/debug - Show debug information
 /help - Show this help message
-/start - Show bot info
 
-<b>Bot Features:</b>
-• ⛏️ Auto-mining every hour
-• 🚀 Auto-tap every 10-15 seconds  
-• 📋 Auto-task completion
-• 💰 Real-time balance updates"""
+<b>⚡ Turbo Features:</b>
+• Tapping every 1-2 seconds
+• Parallel processing
+• Minimal delays
+• Maximum speed
+
+Bot is running at MAXIMUM speed!"""
         send_telegram_message(help_msg)
     
     elif text.lower() == '/start':
-        start_msg = f"""🚀 <b>ATF Miners Bot is Active!</b>
+        start_msg = f"""🚀 <b>ATF Miners Bot - TURBO MODE!</b>
 
-📊 <b>Status:</b> Running
+⚡ <b>Status:</b> Running at max speed
 👥 <b>Accounts:</b> {len(ACCOUNTS)} account(s)
 
-Use /status to check real-time mining status
-Use /debug for troubleshooting
-Use /help for available commands
+⚡ Tapping every 1-2 seconds!
+⚡ Tasks completed instantly!
+⚡ Maximum mining efficiency!
 
-Bot is automatically mining, tapping, and completing tasks!"""
+Send /status to check progress"""
         send_telegram_message(start_msg)
 
 def polling_loop():
     global last_update_id
     print("📡 Started polling for Telegram commands...")
-    print("💬 Send /start to your bot to authorize")
+    print("⚡ TURBO MODE ENABLED - Tapping every 1-2 seconds!")
     
     while True:
         try:
@@ -832,7 +688,7 @@ def main():
     global TELEGRAM_ENABLED
     
     os.system('cls' if os.name == 'nt' else 'clear')
-    print("🚀 ATF Miners Bot")
+    print("⚡ ATF Miners Bot - TURBO MODE")
     print("=" * 50)
     
     if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
@@ -842,6 +698,8 @@ def main():
         print(f"✅ Telegram bot enabled!")
         print("   Send /start to your bot to authorize")
     
+    print("=" * 50)
+    print("⚡ TURBO MODE: Tapping every 1-2 seconds!")
     print("=" * 50)
     
     # Load proxies
@@ -860,7 +718,6 @@ def main():
     # Load queries
     if not os.path.exists("query.txt"):
         print("❌ query.txt not found!")
-        print("   Please create query.txt with your Telegram Web App data")
         sys.exit(1)
         
     with open("query.txt", "r", encoding="utf-8") as f:
@@ -868,25 +725,15 @@ def main():
     
     if not queries:
         print("❌ query.txt is empty!")
-        print("   Add your Telegram Web App query data to query.txt")
         sys.exit(1)
-    
-    print(f"[+] Found {len(queries)} query entries")
     
     for i, q in enumerate(queries):
         proxy = proxies_list[i % len(proxies_list)] if proxies_list else None
         
-        # Validate query format
-        if not q or 'user=' not in q:
-            print(f"⚠️  Warning: Query {i+1} appears to be invalid (missing 'user=')")
-        
-        username = parse_username(q)
-        print(f"   Account {i+1}: {username}")
-        
         ACCOUNTS.append({
             "query": q,
             "proxy": proxy,
-            "username": username,
+            "username": parse_username(q),
             "balance": "0.0",
             "mining_status": "Starting...",
             "mining_end": 0,
@@ -898,13 +745,8 @@ def main():
         
     print(f"[+] Loaded {len(ACCOUNTS)} account(s)")
     print("=" * 50)
-    
-    # Warn about query expiration
-    print("⚠️  Note: The query data in query.txt may expire!")
-    print("   If you see login errors, you need to refresh the query:")
-    print("   1. Open the ATF Miners Telegram Mini App")
-    print("   2. Copy the new query data")
-    print("   3. Update query.txt")
+    print("⚡ Starting TURBO MODE workers...")
+    print("   Each account will tap every 1-2 seconds!")
     print("=" * 50)
 
     # Start Telegram polling
@@ -912,11 +754,11 @@ def main():
         polling_thread = threading.Thread(target=polling_loop, daemon=True)
         polling_thread.start()
 
-    # Start worker threads
+    # Start worker threads with turbo mode
     for acc in ACCOUNTS:
         t = threading.Thread(target=worker_thread, args=(acc,), daemon=True)
         t.start()
-        time.sleep(0.5)
+        time.sleep(0.2)
 
     # Main loop
     if not PRODUCTION_MODE:
@@ -929,7 +771,7 @@ def main():
             print("\n🛑 Bot stopped")
             sys.exit(0)
     else:
-        print("🔄 Bot running in production mode...")
+        print("⚡ Bot running in TURBO MODE...")
         try:
             while True:
                 time.sleep(10)
